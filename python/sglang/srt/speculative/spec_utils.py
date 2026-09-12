@@ -64,7 +64,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import spec_nvtx_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -696,8 +696,13 @@ def draft_tp_context(tp_group: GroupCoordinator):
 def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
+
+    Emits an NVTX range as well when ``SGLANG_ENABLE_NVTX_SPEC=1``, so the
+    stages are attributable in an Nsight Systems timeline. Without it these
+    spans are visible ONLY to an active torch profiler, and an nsys capture
+    silently contains no speculative-phase ranges at all.
     """
-    return profile_range(name)
+    return spec_nvtx_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
