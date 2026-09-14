@@ -1246,7 +1246,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            # Span the target's verification pass as well, so a timeline shows
+            # draft -> verify -> draft_extend rather than draft and draft_extend
+            # with an unlabelled gap where the target forward runs.
+            with spec_stage_span("verify"):
+                batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
