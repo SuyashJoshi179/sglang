@@ -1972,6 +1972,41 @@ def get_spec_draft_tp_group() -> Optional[GroupCoordinator]:
     return _SPEC_DRAFT_TP
 
 
+_SPEC_DRAFT_MEMBERS: Optional[List[int]] = None
+
+
+def get_spec_draft_member_ranks() -> Optional[List[int]]:
+    """TP ranks that host the drafter in subset mode (SGLANG_SPEC_DRAFT_RANKS),
+    or None when every rank runs it."""
+    return _SPEC_DRAFT_MEMBERS
+
+
+def spec_draft_ranks_from_env(tp_size: int, attn_dp_size: int) -> Optional[List[int]]:
+    """Validated SGLANG_SPEC_DRAFT_RANKS as sorted TP ranks, or None when unset
+    or naming every rank."""
+    raw = os.environ.get("SGLANG_SPEC_DRAFT_RANKS", "").strip()
+    if not raw:
+        return None
+    ranks = sorted({int(x) for x in raw.split(",") if x.strip()})
+    if not ranks or ranks[0] < 0 or ranks[-1] >= tp_size:
+        raise ValueError(
+            f"SGLANG_SPEC_DRAFT_RANKS={raw} must name TP ranks in [0, {tp_size})"
+        )
+    if os.environ.get("SGLANG_SPEC_DRAFT_TP_SIZE", "").strip():
+        raise ValueError(
+            "set SGLANG_SPEC_DRAFT_RANKS (subset) or SGLANG_SPEC_DRAFT_TP_SIZE "
+            "(replicated), not both"
+        )
+    if attn_dp_size != 1:
+        raise ValueError(
+            "SGLANG_SPEC_DRAFT_RANKS is for a plain-TP target; it cannot be "
+            "combined with --enable-dp-attention"
+        )
+    if len(ranks) == tp_size:
+        return None
+    return ranks
+
+
 def spec_draft_tp_size_from_env(tp_size: int, attn_dp_size: int) -> Optional[int]:
     """Validated SGLANG_SPEC_DRAFT_TP_SIZE, or None when unset or equal to tp_size."""
     raw = os.environ.get("SGLANG_SPEC_DRAFT_TP_SIZE", "").strip()
@@ -2640,12 +2675,48 @@ def initialize_model_parallel(
     # ranks. Each chunk runs its own copy of the drafter, sharded k-way, over the
     # identical batch and target hidden states that plain TP gives every rank.
     # Created by all ranks in the same order, like every other group here.
-    global _SPEC_DRAFT_TP
+    global _SPEC_DRAFT_TP, _SPEC_DRAFT_MEMBERS
     assert _SPEC_DRAFT_TP is None, "spec draft tp group is already initialized"
+    spec_draft_members = spec_draft_ranks_from_env(
+        tensor_model_parallel_size, attn_dp_size
+    )
     spec_draft_tp_size = spec_draft_tp_size_from_env(
         tensor_model_parallel_size, attn_dp_size
     )
-    if spec_draft_tp_size is not None:
+    if spec_draft_members is not None:
+        # Subset mode: only the member ranks host the drafter. Non-members get
+        # singleton groups so every rank has a coordinator; theirs is never used
+        # for a drafter forward.
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            base = tp_group_idx * tensor_model_parallel_size
+            group_ranks.append([base + r for r in spec_draft_members])
+            group_ranks.extend(
+                [[base + r]
+                 for r in range(tensor_model_parallel_size)
+                 if r not in spec_draft_members]
+            )
+        _SPEC_DRAFT_MEMBERS = list(spec_draft_members)
+        _SPEC_DRAFT_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=(
+                len(spec_draft_members) > 1
+                and os.environ.get("SGLANG_SPEC_DRAFT_TP_CUSTOM_AR", "1") == "1"
+            ),
+            group_name="spec_draft_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+        logger.info(
+            "Spec drafter SUBSET: member TP ranks=%s, groups=%s (target tp_size=%d)",
+            spec_draft_members,
+            group_ranks,
+            tensor_model_parallel_size,
+        )
+    elif spec_draft_tp_size is not None:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             base = tp_group_idx * tensor_model_parallel_size
@@ -3101,10 +3172,11 @@ def destroy_model_parallel():
         _ATTN_TP.destroy()
     _ATTN_TP = None
 
-    global _SPEC_DRAFT_TP
+    global _SPEC_DRAFT_TP, _SPEC_DRAFT_MEMBERS
     if _SPEC_DRAFT_TP:
         _SPEC_DRAFT_TP.destroy()
     _SPEC_DRAFT_TP = None
+    _SPEC_DRAFT_MEMBERS = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
