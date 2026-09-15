@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -8,6 +9,11 @@ import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.parallel_state import (
+    get_spec_draft_member_ranks,
+    get_spec_draft_tp_group,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -96,6 +102,7 @@ from sglang.srt.speculative.spec_utils import (
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
+    spec_draft_subgroup_context,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
@@ -161,7 +168,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
-        if (
+        # Drafter placement (SGLANG_SPEC_DRAFT_RANKS) narrows only the drafter; the
+        # target keeps its plain TP width. Members build it over their group,
+        # non-members over a singleton group (never executed).
+        self.spec_draft_tp_group = get_spec_draft_tp_group()
+        # Subset mode (SGLANG_SPEC_DRAFT_RANKS): only member TP ranks run the drafter.
+        self.target_tp_group = get_tp_group()  # built outside any drafter context
+        self.spec_draft_members = get_spec_draft_member_ranks()
+        self.is_draft_member = (
+            self.spec_draft_members is None
+            or self.target_tp_group.rank_in_group in self.spec_draft_members
+        )
+        if self.spec_draft_members is not None:
+            assert self.topk == 1, "SGLANG_SPEC_DRAFT_RANKS requires --speculative-eagle-topk 1"
+            assert not get_spec().speculative_use_rejection_sampling, (
+                "SGLANG_SPEC_DRAFT_RANKS does not broadcast draft probs"
+            )
+            # Non-members never capture drafter CUDA graphs; keep the attributes
+            # defined so prepare_for_draft* take the eager branch.
+            self.cuda_graph_runner = None
+            self.cuda_graph_runner_for_draft_extend = None
+            logger.info(
+                "Drafter SUBSET: this TP rank %d %s the drafter (members %s)",
+                self.target_tp_group.rank_in_group,
+                "HOSTS" if self.is_draft_member else "does NOT host",
+                self.spec_draft_members,
+            )
+        if self.spec_draft_tp_group is not None:
+            assert self.speculative_algorithm.is_eagle3(), (
+                "drafter subgroups are only wired for EAGLE3"
+            )
+            ctx = spec_draft_subgroup_context(self.spec_draft_tp_group)
+        elif (
             get_parallel().enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
         ):
@@ -188,9 +226,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
+        if self.spec_draft_tp_group is not None:
+            assert self.draft_runner.tp_group is self.spec_draft_tp_group, (
+                "draft runner did not pick up the drafter group at construction"
+            )
+            self.draft_tp_context = spec_draft_subgroup_context
+        else:
+            self.draft_tp_context = (
+                draft_tp_context
+                if get_parallel().enable_dp_attention
+                else empty_context
+            )
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -204,11 +250,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        # The KV pool reads the per-rank KV head count from attn_tp_size when it
+        # is built. Under a drafter subgroup that must be the drafter's width, not
+        # the target's, or the draft KV buffers get the wrong head count.
+        pool_ctx = (
+            spec_draft_subgroup_context(self.spec_draft_tp_group)
+            if self.spec_draft_tp_group is not None
+            else empty_context()
         )
+        with pool_ctx:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        # Outside the drafter context: init_lm_head may gather over the target group.
         self.init_token_map()
         self.init_lm_head()
 
@@ -238,6 +294,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.init_attention_backend()
 
     def init_cuda_graphs(self):
+        if not self.is_draft_member:
+            logger.info("Drafter SUBSET: non-member rank, skipping drafter CUDA graph capture")
+            if (c := self.draft_runner.canary_manager) is not None:
+                c.mark_init_finished()
+            return
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -316,6 +377,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     embed.device
                 )
 
+            if self.spec_draft_tp_group is not None:
+                self._reshard_draft_embed_for_subgroup()
+
         else:
             if self.hot_token_id is not None and head is not None:
                 head = head.clone()
@@ -325,6 +389,50 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _reshard_draft_embed_for_subgroup(self):
+        """Give the drafter an embedding sharded over its own group.
+
+        ``set_embed`` may install the target's embedding, sharded over the
+        target's full TP group. The drafter's embedding forward all-reduces over
+        the drafter's narrower group, so it would sum only some vocabulary
+        shards and silently produce wrong embeddings (lower acceptance, correct
+        text). Detect that by shard size and re-shard from the full table.
+        """
+        emb = self.draft_runner.model.model.embed_tokens
+        k = self.spec_draft_tp_group.world_size
+        assert emb.tp_size == k, (
+            f"draft embedding was built for tp_size={emb.tp_size}, drafter group is {k}"
+        )
+        rows = emb.num_embeddings_per_partition
+        if emb.weight.shape[0] == rows:
+            logger.info(
+                "Drafter placement: draft embedding already %d-way sharded "
+                "(%d rows); keeping it.",
+                k,
+                rows,
+            )
+            return
+        # Runs outside any drafter context: get_tp_group() is the target's group.
+        target_group = get_tp_group()
+        full = target_group.all_gather(emb.weight.data.contiguous(), dim=0)[
+            : emb.org_vocab_size
+        ]
+        idx = emb.shard_indices
+        start, end = idx.org_vocab_start_index, idx.org_vocab_end_index
+        shard = torch.zeros(
+            (rows, full.shape[1]), dtype=full.dtype, device=full.device
+        )
+        shard[: end - start].copy_(full[start:end])
+        del emb.weight
+        emb.weight = torch.nn.Parameter(shard, requires_grad=False)
+        logger.info(
+            "Drafter placement: re-sharded target embedding %d-way for the drafter "
+            "(vocab rows %d..%d on this rank).",
+            k,
+            start,
+            end,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -568,6 +676,178 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_draft_tokens=self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
+        )
+
+    # ------------------------------------------------------------------ subset mode
+    def draft_subset(self, batch: ScheduleBatch):
+        """Subset-mode draft step, called on EVERY target TP rank (outside the
+        drafter context; members enter it here).
+
+        Members run the drafter and the first member broadcasts ``draft_tokens``
+        over the target TP group; non-members run only the host-side bookkeeping
+        and receive. For topk=1 ``parent_list`` / ``top_scores_index`` are the
+        runtime-invariant chain buffers every rank already holds, so the draft
+        tokens are the only data that has to move. Every rank then builds the
+        verify input locally from identical inputs.
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        if batch.forward_mode.is_idle():
+            # Plain TP has no idle ranks; keep the upstream idle path on members.
+            if self.is_draft_member:
+                with self.draft_tp_context(self.draft_runner.tp_group):
+                    return self.draft(batch)
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.device,
+            )
+
+        bs = batch.seq_lens.shape[0]
+        steps = self.speculative_num_steps
+        if self.is_draft_member:
+            with self.draft_tp_context(self.draft_runner.tp_group):
+                forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+                    draft_input,
+                    self.req_to_token_pool,
+                    batch,
+                    self.cuda_graph_runner,
+                    self.draft_runner,
+                    self.topk,
+                    steps,
+                )
+                if can_run_decode_cuda_graph:
+                    parent_list, top_scores_index, draft_tokens, _ = (
+                        self.cuda_graph_runner.execute(forward_batch)
+                    )
+                else:
+                    if steps > 1:
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
+                    parent_list, top_scores_index, draft_tokens, _ = (
+                        self.draft_forward(forward_batch)
+                    )
+            assert draft_tokens.shape == (bs, steps) and draft_tokens.dtype == torch.int64, (
+                f"subset broadcast expects draft_tokens ({bs}, {steps}) int64, got "
+                f"{tuple(draft_tokens.shape)} {draft_tokens.dtype}"
+            )
+            payload = draft_tokens.contiguous()
+        else:
+            # Same host-side bookkeeping as a member (batch.out_cache_loc etc.),
+            # no drafter forward.
+            prepare_for_draft(
+                draft_input,
+                self.req_to_token_pool,
+                batch,
+                None,
+                self.draft_runner,
+                self.topk,
+                steps,
+            )
+            payload = torch.empty((bs, steps), dtype=torch.int64, device=self.device)
+            parent_list = top_scores_index = None
+
+        # src is a rank local to the target TP group, i.e. a TP rank.
+        self.target_tp_group.broadcast(payload, src=self.spec_draft_members[0])
+
+        if parent_list is None:
+            if bs <= self._topk1_parents_prealloc.shape[0]:
+                parent_list = self._topk1_parents_prealloc[:bs]
+                top_scores_index = self._topk1_score_indices_prealloc[:bs]
+            else:
+                pw = steps if steps > 1 else 0
+                parent_list = torch.arange(
+                    -1, pw - 1, dtype=torch.long, device=self.device
+                ).repeat(bs, 1)
+                top_scores_index = torch.arange(
+                    steps, dtype=torch.long, device=self.device
+                ).repeat(bs, 1)
+
+        return build_eagle_verify_input(
+            batch,
+            draft_input,
+            parent_list,
+            top_scores_index,
+            payload,
+            None,
+            target_worker=self.target_worker,
+            topk=self.topk,
+            num_steps=steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            tree_mask_mode=self.tree_mask_mode,
+            device=self.device,
+        )
+
+    def _subset_placeholder_state(self, bs: int):
+        hidden = self.draft_runner.model_config.hidden_size
+        dtype = self.draft_runner.model_config.dtype
+        return (
+            torch.ones((bs, self.topk), dtype=torch.float32, device=self.device),
+            torch.zeros((bs, self.topk), dtype=torch.int64, device=self.device),
+            torch.zeros((bs, hidden), dtype=dtype, device=self.device),
+        )
+
+    def draft_extend_for_prefill_nonmember(
+        self, batch: ScheduleBatch, next_token_ids: torch.Tensor
+    ) -> EagleDraftInput:
+        """Non-member prefill: same batch rewrites as a member, no drafter forward."""
+        if not batch.forward_mode.is_idle():
+            tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+            new_input_ids = torch.empty_like(batch.input_ids)
+            pt = 0
+            for i, extend_len in enumerate(batch.extend_lens):
+                input_ids = batch.input_ids[pt : pt + extend_len]
+                new_input_ids[pt : pt + extend_len].copy_(
+                    torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
+                )
+                pt += extend_len
+            batch.input_ids = new_input_ids
+        bs = len(batch.seq_lens)
+        topk_p, topk_index, hidden_states = self._subset_placeholder_state(bs)
+        batch.spec_info = EagleDraftExtendInput(
+            hidden_states=hidden_states,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+        return EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            draft_probs=None,
+            hidden_states=hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
+    def draft_extend_for_decode_nonmember(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        """Non-member decode draft-extend: same batch rewrites, placeholders only."""
+        draft_extend_input = EagleDraftExtendInput(
+            hidden_states=batch_result.logits_output.hidden_states,
+            num_correct_drafts=batch_result.accept_lens - 1,
+            num_accept_tokens=batch_result.accept_lens,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+        )
+        next_token_ids = batch_result.next_token_ids.to(torch.int64)
+        with self.plan_stream_ctx:
+            prepare_for_draft_extend(
+                draft_extend_input,
+                batch,
+                next_token_ids,
+                self.speculative_num_draft_tokens,
+                self.draft_runner,
+                None,
+                return_hidden_states_before_norm=False,
+            )
+        if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+        nd = batch_result.next_draft_input
+        nd.topk_p, nd.topk_index, nd.hidden_states = self._subset_placeholder_state(
+            len(batch.seq_lens)
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -1112,6 +1392,40 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # Every target rank must verify the same draft tokens; in subset mode they
+        # arrive by broadcast. Debug-only check (adds one all-gather per step):
+        # SGLANG_SPEC_DRAFT_TP_CHECK=1.
+        self._check_draft_subgroup_consistency = (
+            self._draft_worker is not None
+            and self._draft_worker.spec_draft_tp_group is not None
+            and os.environ.get("SGLANG_SPEC_DRAFT_TP_CHECK", "0") == "1"
+        )
+        self._draft_consistency_checks = 0
+
+    def _assert_draft_tokens_consistent(self, draft_token: torch.Tensor) -> None:
+        group = get_tp_group()  # target group; called outside the drafter context
+        if group.world_size == 1 or draft_token.numel() == 0:
+            return
+        gathered = group.all_gather(draft_token.contiguous().view(1, -1), dim=0)
+        bad = (gathered != gathered[:1]).any(dim=1)
+        self._draft_consistency_checks += 1
+        if bool(bad.any()):
+            ranks = bad.nonzero().flatten().tolist()
+            n_diff = int((gathered != gathered[:1]).sum())
+            raise RuntimeError(
+                f"Draft tokens disagree across target TP ranks: ranks {ranks} differ from rank 0 "
+                f"in {n_diff} of {draft_token.numel()} draft tokens "
+                f"(check #{self._draft_consistency_checks})"
+            )
+        if self._draft_consistency_checks in (1, 100, 1000):
+            logger.info(
+                "Draft-token consistency check #%d passed (%d draft tokens, "
+                "%d ranks identical)",
+                self._draft_consistency_checks,
+                draft_token.numel(),
+                group.world_size,
+            )
+
     @property
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
@@ -1192,6 +1506,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._draft_worker is None:
                 return batch_output
 
+            if not self.draft_worker.is_draft_member:
+                # Subset mode, non-member rank: no drafter forward.
+                with spec_stage_span("draft_extend"):
+                    batch_output.next_draft_input = (
+                        self.draft_worker.draft_extend_for_prefill_nonmember(
+                            batch, batch_output.next_token_ids
+                        )
+                    )
+                return batch_output
+
             # Draft prefill
             with (
                 self.draft_worker.draft_tp_context(
@@ -1234,6 +1558,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
+            elif self.draft_worker.spec_draft_members is not None:
+                # Subset mode: members draft and broadcast; every rank builds the
+                # verify input. Enters the drafter context internally.
+                with spec_stage_span("draft"):
+                    verify_input = self.draft_worker.draft_subset(batch)
             else:
                 with (
                     self.draft_worker.draft_tp_context(
@@ -1245,6 +1574,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
+            if self._check_draft_subgroup_consistency:
+                self._assert_draft_tokens_consistent(verify_input.draft_token)
             batch.spec_info = verify_input
             # Span the target's verification pass as well, so a timeline shows
             # draft -> verify -> draft_extend rather than draft and draft_extend
@@ -1259,6 +1590,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
+            elif not self.draft_worker.is_draft_member:
+                with spec_stage_span("draft_extend"):
+                    self.draft_worker.draft_extend_for_decode_nonmember(
+                        batch, batch_output
+                    )
             else:
                 with (
                     self.draft_worker.draft_tp_context(
