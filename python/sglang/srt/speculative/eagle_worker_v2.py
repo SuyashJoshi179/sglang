@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -8,6 +9,10 @@ import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.parallel_state import (
+    get_spec_draft_tp_group,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -96,6 +101,7 @@ from sglang.srt.speculative.spec_utils import (
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
+    spec_draft_subgroup_context,
     spec_stage_span,
 )
 from sglang.srt.utils.async_probe import (
@@ -161,7 +167,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
-        if (
+        # A drafter subgroup (SGLANG_SPEC_DRAFT_TP_SIZE) narrows only the drafter;
+        # the target keeps its plain TP width.
+        self.spec_draft_tp_group = get_spec_draft_tp_group()
+        if self.spec_draft_tp_group is not None:
+            assert self.speculative_algorithm.is_eagle3(), (
+                "SGLANG_SPEC_DRAFT_TP_SIZE is only wired for EAGLE3"
+            )
+            ctx = spec_draft_subgroup_context(self.spec_draft_tp_group)
+        elif (
             get_parallel().enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
         ):
@@ -188,9 +202,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
+        if self.spec_draft_tp_group is not None:
+            assert self.draft_runner.tp_group is self.spec_draft_tp_group, (
+                "draft runner did not pick up the drafter subgroup at construction"
+            )
+            self.draft_tp_context = spec_draft_subgroup_context
+        else:
+            self.draft_tp_context = (
+                draft_tp_context
+                if get_parallel().enable_dp_attention
+                else empty_context
+            )
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -204,11 +226,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        # The KV pool reads the per-rank KV head count from attn_tp_size when it
+        # is built. Under a drafter subgroup that must be the drafter's width, not
+        # the target's, or the draft KV buffers get the wrong head count.
+        pool_ctx = (
+            spec_draft_subgroup_context(self.spec_draft_tp_group)
+            if self.spec_draft_tp_group is not None
+            else empty_context()
         )
+        with pool_ctx:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        # Outside the drafter context: init_lm_head may gather over the target group.
         self.init_token_map()
         self.init_lm_head()
 
@@ -316,6 +348,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     embed.device
                 )
 
+            if self.spec_draft_tp_group is not None:
+                self._reshard_draft_embed_for_subgroup()
+
         else:
             if self.hot_token_id is not None and head is not None:
                 head = head.clone()
@@ -325,6 +360,50 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _reshard_draft_embed_for_subgroup(self):
+        """Give the drafter an embedding sharded over its own group.
+
+        ``set_embed`` may install the target's embedding, sharded over the
+        target's full TP group. The drafter's embedding forward all-reduces over
+        the drafter's narrower group, so it would sum only some vocabulary
+        shards and silently produce wrong embeddings (lower acceptance, correct
+        text). Detect that by shard size and re-shard from the full table.
+        """
+        emb = self.draft_runner.model.model.embed_tokens
+        k = self.spec_draft_tp_group.world_size
+        assert emb.tp_size == k, (
+            f"draft embedding was built for tp_size={emb.tp_size}, drafter group is {k}"
+        )
+        rows = emb.num_embeddings_per_partition
+        if emb.weight.shape[0] == rows:
+            logger.info(
+                "Drafter subgroup: draft embedding already %d-way sharded "
+                "(%d rows); keeping it.",
+                k,
+                rows,
+            )
+            return
+        # Runs outside any drafter context: get_tp_group() is the target's group.
+        target_group = get_tp_group()
+        full = target_group.all_gather(emb.weight.data.contiguous(), dim=0)[
+            : emb.org_vocab_size
+        ]
+        idx = emb.shard_indices
+        start, end = idx.org_vocab_start_index, idx.org_vocab_end_index
+        shard = torch.zeros(
+            (rows, full.shape[1]), dtype=full.dtype, device=full.device
+        )
+        shard[: end - start].copy_(full[start:end])
+        del emb.weight
+        emb.weight = torch.nn.Parameter(shard, requires_grad=False)
+        logger.info(
+            "Drafter subgroup: re-sharded target embedding %d-way for the drafter "
+            "(vocab rows %d..%d on this rank).",
+            k,
+            start,
+            end,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -1112,6 +1191,40 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # Drafter subgroups run independent drafter copies; if they ever disagree,
+        # the target's TP ranks would verify different tokens. Debug-only check
+        # (adds one all-gather per step): SGLANG_SPEC_DRAFT_TP_CHECK=1.
+        self._check_draft_subgroup_consistency = (
+            self._draft_worker is not None
+            and self._draft_worker.spec_draft_tp_group is not None
+            and os.environ.get("SGLANG_SPEC_DRAFT_TP_CHECK", "0") == "1"
+        )
+        self._draft_consistency_checks = 0
+
+    def _assert_draft_tokens_consistent(self, draft_token: torch.Tensor) -> None:
+        group = get_tp_group()  # target group; called outside the drafter context
+        if group.world_size == 1 or draft_token.numel() == 0:
+            return
+        gathered = group.all_gather(draft_token.contiguous().view(1, -1), dim=0)
+        bad = (gathered != gathered[:1]).any(dim=1)
+        self._draft_consistency_checks += 1
+        if bool(bad.any()):
+            ranks = bad.nonzero().flatten().tolist()
+            n_diff = int((gathered != gathered[:1]).sum())
+            raise RuntimeError(
+                f"Drafter subgroup copies disagree: ranks {ranks} differ from rank 0 "
+                f"in {n_diff} of {draft_token.numel()} draft tokens "
+                f"(check #{self._draft_consistency_checks})"
+            )
+        if self._draft_consistency_checks in (1, 100, 1000):
+            logger.info(
+                "Drafter subgroup consistency check #%d passed (%d draft tokens, "
+                "%d ranks identical)",
+                self._draft_consistency_checks,
+                draft_token.numel(),
+                group.world_size,
+            )
+
     @property
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
@@ -1245,6 +1358,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
+            if self._check_draft_subgroup_consistency:
+                self._assert_draft_tokens_consistent(verify_input.draft_token)
             batch.spec_info = verify_input
             # Span the target's verification pass as well, so a timeline shows
             # draft -> verify -> draft_extend rather than draft and draft_extend

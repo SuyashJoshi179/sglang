@@ -1931,6 +1931,9 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+# Narrower tensor-parallel group for the speculative drafter under a plain-TP
+# target (SGLANG_SPEC_DRAFT_TP_SIZE). None unless that is set.
+_SPEC_DRAFT_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -1961,6 +1964,32 @@ def get_attn_tp_group() -> GroupCoordinator:
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
     return _ATTN_TP
+
+
+def get_spec_draft_tp_group() -> Optional[GroupCoordinator]:
+    """The drafter's own tensor-parallel group, or None when the drafter shares
+    the target's width (the default)."""
+    return _SPEC_DRAFT_TP
+
+
+def spec_draft_tp_size_from_env(tp_size: int, attn_dp_size: int) -> Optional[int]:
+    """Validated SGLANG_SPEC_DRAFT_TP_SIZE, or None when unset or equal to tp_size."""
+    raw = os.environ.get("SGLANG_SPEC_DRAFT_TP_SIZE", "").strip()
+    if not raw:
+        return None
+    k = int(raw)
+    if k == tp_size:
+        return None
+    if k < 1 or tp_size % k != 0:
+        raise ValueError(
+            f"SGLANG_SPEC_DRAFT_TP_SIZE={k} must divide the target tp_size={tp_size}"
+        )
+    if attn_dp_size != 1:
+        raise ValueError(
+            "SGLANG_SPEC_DRAFT_TP_SIZE is for a plain-TP target; it cannot be "
+            "combined with --enable-dp-attention, which already narrows the drafter"
+        )
+    return k
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -2607,6 +2636,43 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    # Drafter subgroups: partition every TP group into consecutive chunks of k
+    # ranks. Each chunk runs its own copy of the drafter, sharded k-way, over the
+    # identical batch and target hidden states that plain TP gives every rank.
+    # Created by all ranks in the same order, like every other group here.
+    global _SPEC_DRAFT_TP
+    assert _SPEC_DRAFT_TP is None, "spec draft tp group is already initialized"
+    spec_draft_tp_size = spec_draft_tp_size_from_env(
+        tensor_model_parallel_size, attn_dp_size
+    )
+    if spec_draft_tp_size is not None:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            base = tp_group_idx * tensor_model_parallel_size
+            for chunk in range(tensor_model_parallel_size // spec_draft_tp_size):
+                st = base + chunk * spec_draft_tp_size
+                group_ranks.append(list(range(st, st + spec_draft_tp_size)))
+        _SPEC_DRAFT_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            # Same collective stack as the target's TP group, so a width change
+            # is not confounded with a different all-reduce implementation.
+            use_custom_allreduce=(
+                os.environ.get("SGLANG_SPEC_DRAFT_TP_CUSTOM_AR", "1") == "1"
+            ),
+            group_name="spec_draft_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+        logger.info(
+            "Spec drafter TP group: size=%d, groups=%s (target tp_size=%d)",
+            spec_draft_tp_size,
+            group_ranks,
+            tensor_model_parallel_size,
+        )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = derived_widths["moe_tp_size"]
@@ -3034,6 +3100,11 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
+
+    global _SPEC_DRAFT_TP
+    if _SPEC_DRAFT_TP:
+        _SPEC_DRAFT_TP.destroy()
+    _SPEC_DRAFT_TP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]

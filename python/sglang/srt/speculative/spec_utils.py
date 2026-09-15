@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    get_parallel,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
@@ -691,6 +692,23 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # Draft model doesn't use dp and has its own tp group.
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
+        yield
+
+
+@contextmanager
+def spec_draft_subgroup_context(tp_group: GroupCoordinator):
+    """Run the drafter on its own narrower TP group under a plain-TP target.
+
+    ``draft_tp_context`` only swaps the TP fields; with DP-attention that is
+    enough because the attention-TP fields already equal the drafter's group.
+    Without DP-attention they still describe the target's full width, and layers
+    such as the LogitsProcessor read them, so override them to match.
+    """
+    with patch_tensor_parallel_group(tp_group), get_parallel().override(
+        attn_tp_size=tp_group.world_size,
+        attn_tp_rank=tp_group.rank_in_group,
+        attn_tp_group=tp_group,
+    ):
         yield
 
 
