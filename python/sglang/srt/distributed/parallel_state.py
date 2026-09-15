@@ -2695,6 +2695,15 @@ def initialize_model_parallel(
                 rank_offset=rank_offset,
                 max_world_size=max_world_size,
             )
+        ca = _SPEC_DRAFT_TP.ca_comm
+        if ca is not None and not getattr(ca, "full_nvlink", True):
+            # Legacy CustomAllreduce admits a 2-rank group without NVLink, but its
+            # kernel busy-waits on a peer it cannot reach over IPC; on a
+            # cross-socket PCIe pair the first drafter all-reduce (in CUDA-graph
+            # capture) never completes. Fall back to NCCL for such member sets.
+            ca.disabled = True
+            ca.original_disabled = True
+            draft_ar = "nccl (members not fully NVLink-connected)"
         logger.info(
             "Spec drafter SUBSET: member TP ranks=%s, groups=%s (target tp_size=%d), "
             "drafter all-reduce=%s (ca_comm=%s); target TP ca_comm=%s",
@@ -2702,7 +2711,7 @@ def initialize_model_parallel(
             group_ranks,
             tensor_model_parallel_size,
             draft_ar if use_ca else "nccl",
-            type(_SPEC_DRAFT_TP.ca_comm).__name__ if _SPEC_DRAFT_TP.ca_comm is not None else None,
+            (type(ca).__name__ + (" disabled" if ca.disabled else "")) if ca is not None else None,
             type(_TP.ca_comm).__name__ if _TP.ca_comm is not None else None,
         )
 
