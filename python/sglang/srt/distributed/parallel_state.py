@@ -2667,24 +2667,43 @@ def initialize_model_parallel(
                  if r not in spec_draft_members]
             )
         _SPEC_DRAFT_MEMBERS = list(spec_draft_members)
-        _SPEC_DRAFT_TP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_custom_allreduce=(
-                len(spec_draft_members) > 1
-                and os.environ.get("SGLANG_SPEC_DRAFT_TP_CUSTOM_AR", "1") == "1"
-            ),
-            group_name="spec_draft_tp",
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
+        # Drafter-group all-reduce: "legacy" (default) = CUDA-IPC CustomAllreduce;
+        # "nccl" = no custom all-reduce; "v2" = CustomAllReduceV2.
+        # v2 sets up torch symmetric memory with a rendezvous that only the member
+        # ranks perform; a later symmetric-memory rendezvous on the target TP group
+        # (e.g. the logits multimem all-gather during verify CUDA-graph capture)
+        # then deadlocks on every rank. Legacy CustomAllreduce uses CUDA IPC only.
+        draft_ar = os.environ.get("SGLANG_SPEC_DRAFT_TP_AR", "legacy").strip().lower()
+        if os.environ.get("SGLANG_SPEC_DRAFT_TP_CUSTOM_AR", "1") == "0":
+            draft_ar = "nccl"
+        if draft_ar not in ("legacy", "nccl", "v2"):
+            raise ValueError(f"SGLANG_SPEC_DRAFT_TP_AR={draft_ar} not in legacy|nccl|v2")
+        use_ca = len(spec_draft_members) > 1 and draft_ar != "nccl"
+        ar_ctx = (
+            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.override(False)
+            if draft_ar == "legacy"
+            else nullcontext()
         )
+        with ar_ctx:
+            _SPEC_DRAFT_TP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_custom_allreduce=use_ca,
+                group_name="spec_draft_tp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
         logger.info(
-            "Spec drafter SUBSET: member TP ranks=%s, groups=%s (target tp_size=%d)",
+            "Spec drafter SUBSET: member TP ranks=%s, groups=%s (target tp_size=%d), "
+            "drafter all-reduce=%s (ca_comm=%s); target TP ca_comm=%s",
             spec_draft_members,
             group_ranks,
             tensor_model_parallel_size,
+            draft_ar if use_ca else "nccl",
+            type(_SPEC_DRAFT_TP.ca_comm).__name__ if _SPEC_DRAFT_TP.ca_comm is not None else None,
+            type(_TP.ca_comm).__name__ if _TP.ca_comm is not None else None,
         )
 
     moe_ep_size = expert_model_parallel_size
